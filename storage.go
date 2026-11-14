@@ -21,9 +21,12 @@ var ErrNotFound = errors.New("storage: object not found")
 // ErrInvalidKey is returned (wrapped) when a key fails ValidateKey.
 var ErrInvalidKey = errors.New("storage: invalid key")
 
-// maxKeyLen is S3's limit; enforcing it everywhere keeps keys portable
-// between backends.
-const maxKeyLen = 1024
+// Limits enforced everywhere to keep keys portable: S3's key length and the
+// usual filesystem file name length.
+const (
+	maxKeyLen     = 1024
+	maxSegmentLen = 255
+)
 
 // Storage keeps immutable-by-convention blobs addressed by a key. Keys are
 // forward-slash separated paths (see ValidateKey). Implementations must be
@@ -61,10 +64,12 @@ type ObjectInfo struct {
 const defaultContentType = "application/octet-stream"
 
 // ValidateKey reports whether key is a safe, portable object key: a non-empty,
-// valid UTF-8 string of at most 1024 bytes made of non-empty segments joined
-// by "/". It must not start or end with "/", contain "." or ".." segments,
-// backslashes or NUL bytes. Every backend calls it, so a key accepted by one is
-// accepted by all.
+// valid UTF-8 string of at most 1024 bytes made of non-empty segments of at
+// most 255 bytes joined by "/". It must not start or end with "/", contain "."
+// or ".." segments, backslashes or NUL bytes. Every backend calls it, so a key
+// accepted by one is accepted by all; the limits are those of S3 (key) and of
+// common filesystems (segment). A backend may add its own budget: s3's key
+// prefix counts towards the 1024 bytes.
 func ValidateKey(key string) error {
 	switch {
 	case key == "":
@@ -86,6 +91,9 @@ func ValidateKey(key string) error {
 			return invalidKey(key, "empty segment")
 		case ".", "..":
 			return invalidKey(key, "relative segment")
+		}
+		if len(seg) > maxSegmentLen {
+			return invalidKey(key, "segment too long")
 		}
 	}
 	return nil

@@ -1,6 +1,7 @@
 package s3_test
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -263,5 +264,78 @@ func TestPresign(t *testing.T) {
 		if _, err := s.PresignGet(t.Context(), "k", ttl); err == nil {
 			t.Errorf("ttl %v accepted", ttl)
 		}
+	}
+}
+
+func TestPrefixCountsTowardKeyLimit(t *testing.T) {
+	client, rec := fakeS3(t)
+	s := s3.New(client, "bkt", s3.WithPrefix(strings.Repeat("p", 99))) // stored as 100 bytes with "/"
+	ctx := t.Context()
+	seg := strings.Repeat("a", 255)
+	fits := strings.Join([]string{seg, seg, seg, strings.Repeat("a", 1024-100-3*255-3)}, "/")
+	if len(fits) != 1024-100 {
+		t.Fatalf("bad fixture: %d", len(fits))
+	}
+	if err := s.Put(ctx, fits, strings.NewReader("x"), storage.PutOptions{}); err != nil {
+		t.Fatalf("key at the limit rejected: %v", err)
+	}
+	n := len(rec.requests)
+
+	tooLong := fits + "a"
+	if err := storage.ValidateKey(tooLong); err != nil {
+		t.Fatalf("fixture must pass core validation: %v", err)
+	}
+	checks := map[string]error{
+		"Put":        s.Put(ctx, tooLong, strings.NewReader("x"), storage.PutOptions{}),
+		"Delete":     s.Delete(ctx, tooLong),
+		"Stat":       func() error { _, err := s.Stat(ctx, tooLong); return err }(),
+		"Get":        func() error { _, _, err := s.Get(ctx, tooLong); return err }(),
+		"PresignGet": func() error { _, err := s.PresignGet(ctx, tooLong, time.Minute); return err }(),
+		"PresignPut": func() error { _, err := s.PresignPut(ctx, tooLong, time.Minute, storage.PutOptions{}); return err }(),
+	}
+	for op, err := range checks {
+		if !errors.Is(err, storage.ErrInvalidKey) {
+			t.Errorf("%s err = %v, want ErrInvalidKey", op, err)
+		}
+	}
+	if len(rec.requests) != n {
+		t.Errorf("overflowing keys reached the server: %v", rec.requests[n:])
+	}
+}
+
+// endless yields data forever in small chunks and cancels ctx once enough was
+// read, like a slow upload whose request is abandoned. It counts the Reads
+// that still arrive afterwards.
+type endless struct {
+	cancel    context.CancelFunc
+	read      int
+	cancelled bool
+	after     int
+}
+
+func (e *endless) Read(p []byte) (int, error) {
+	if e.cancelled {
+		e.after++
+	}
+	n := min(len(p), 32<<10)
+	if e.read += n; e.read > 1<<20 && !e.cancelled {
+		e.cancelled = true
+		e.cancel()
+	}
+	return n, nil
+}
+
+func TestPutStopsReadingOnCancel(t *testing.T) {
+	client, _ := fakeS3(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	src := &endless{cancel: cancel}
+
+	err := s3.New(client, "bkt").Put(ctx, "k", src, storage.PutOptions{})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+	if src.after != 0 {
+		t.Errorf("source was read %d more times after cancellation", src.after)
 	}
 }

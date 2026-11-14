@@ -18,7 +18,11 @@ import (
 	"github.com/rum-go-framework/storage"
 )
 
-const defaultContentType = "application/octet-stream"
+const (
+	defaultContentType = "application/octet-stream"
+	// maxKeyLen is S3's object key limit, which includes our prefix.
+	maxKeyLen = 1024
+)
 
 // Storage keeps objects in one bucket, optionally below a key prefix.
 type Storage struct {
@@ -65,13 +69,14 @@ func New(client *awss3.Client, bucket string, opts ...Option) *Storage {
 // switches to a multipart upload for large bodies, buffering one part at a
 // time, and aborts it on error so no partial object appears.
 func (s *Storage) Put(ctx context.Context, key string, r io.Reader, opts storage.PutOptions) error {
-	if err := storage.ValidateKey(key); err != nil {
+	full, err := s.objectKey(key)
+	if err != nil {
 		return err
 	}
-	_, err := s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
+	_, err = s.uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket:      aws.String(s.bucket),
-		Key:         aws.String(s.prefix + key),
-		Body:        r,
+		Key:         aws.String(full),
+		Body:        ctxReader{ctx, r},
 		ContentType: aws.String(contentType(opts.ContentType)),
 	})
 	if err != nil {
@@ -81,12 +86,13 @@ func (s *Storage) Put(ctx context.Context, key string, r io.Reader, opts storage
 }
 
 func (s *Storage) Get(ctx context.Context, key string) (io.ReadCloser, storage.ObjectInfo, error) {
-	if err := storage.ValidateKey(key); err != nil {
+	full, err := s.objectKey(key)
+	if err != nil {
 		return nil, storage.ObjectInfo{}, err
 	}
 	out, err := s.client.GetObject(ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.prefix + key),
+		Key:    aws.String(full),
 	})
 	if err != nil {
 		return nil, storage.ObjectInfo{}, mapErr("get", key, err)
@@ -95,12 +101,13 @@ func (s *Storage) Get(ctx context.Context, key string) (io.ReadCloser, storage.O
 }
 
 func (s *Storage) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
-	if err := storage.ValidateKey(key); err != nil {
+	full, err := s.objectKey(key)
+	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
 	out, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.prefix + key),
+		Key:    aws.String(full),
 	})
 	if err != nil {
 		return storage.ObjectInfo{}, mapErr("stat", key, err)
@@ -110,12 +117,13 @@ func (s *Storage) Stat(ctx context.Context, key string) (storage.ObjectInfo, err
 
 // Delete is idempotent because S3's DeleteObject succeeds for missing keys.
 func (s *Storage) Delete(ctx context.Context, key string) error {
-	if err := storage.ValidateKey(key); err != nil {
+	full, err := s.objectKey(key)
+	if err != nil {
 		return err
 	}
-	_, err := s.client.DeleteObject(ctx, &awss3.DeleteObjectInput{
+	_, err = s.client.DeleteObject(ctx, &awss3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.prefix + key),
+		Key:    aws.String(full),
 	})
 	if err != nil {
 		return fmt.Errorf("storage/s3: delete %q: %w", key, err)
@@ -127,12 +135,13 @@ func (s *Storage) Delete(ctx context.Context, key string) error {
 // plain GET for ttl, without credentials. It does not check that the object
 // exists.
 func (s *Storage) PresignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
-	if err := validatePresign(key, ttl); err != nil {
+	full, err := s.presignKey(key, ttl)
+	if err != nil {
 		return "", err
 	}
 	req, err := s.presign.PresignGetObject(ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(s.prefix + key),
+		Key:    aws.String(full),
 	}, awss3.WithPresignExpires(ttl))
 	if err != nil {
 		return "", fmt.Errorf("storage/s3: presign get %q: %w", key, err)
@@ -145,12 +154,13 @@ func (s *Storage) PresignGet(ctx context.Context, key string, ttl time.Duration)
 // the client must send exactly that Content-Type header, which stops it
 // storing a different type than the app intended.
 func (s *Storage) PresignPut(ctx context.Context, key string, ttl time.Duration, opts storage.PutOptions) (string, error) {
-	if err := validatePresign(key, ttl); err != nil {
+	full, err := s.presignKey(key, ttl)
+	if err != nil {
 		return "", err
 	}
 	req, err := s.presign.PresignPutObject(ctx, &awss3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),
-		Key:         aws.String(s.prefix + key),
+		Key:         aws.String(full),
 		ContentType: aws.String(contentType(opts.ContentType)),
 	}, awss3.WithPresignExpires(ttl))
 	if err != nil {
@@ -159,14 +169,39 @@ func (s *Storage) PresignPut(ctx context.Context, key string, ttl time.Duration,
 	return req.URL, nil
 }
 
-func validatePresign(key string, ttl time.Duration) error {
+// objectKey validates key and returns the full S3 key. The prefix eats into
+// S3's key length limit, so overflow is rejected here as ErrInvalidKey instead
+// of surfacing as an opaque server error.
+func (s *Storage) objectKey(key string) (string, error) {
 	if err := storage.ValidateKey(key); err != nil {
-		return err
+		return "", err
 	}
+	if len(s.prefix)+len(key) > maxKeyLen {
+		return "", fmt.Errorf("%w: prefix %q plus key exceed %d bytes: %q", storage.ErrInvalidKey, s.prefix, maxKeyLen, key)
+	}
+	return s.prefix + key, nil
+}
+
+func (s *Storage) presignKey(key string, ttl time.Duration) (string, error) {
 	if ttl <= 0 {
-		return errors.New("storage/s3: presign ttl must be positive")
+		return "", errors.New("storage/s3: presign ttl must be positive")
 	}
-	return nil
+	return s.objectKey(key)
+}
+
+// ctxReader stops a copy loop once ctx is cancelled: the transfer manager
+// keeps reading to fill its part buffers, and a slow source would otherwise
+// outlive the request.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 func info(key string, size *int64, ct *string, mod *time.Time) storage.ObjectInfo {

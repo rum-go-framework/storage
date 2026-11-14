@@ -27,8 +27,9 @@ Every backend behaves the same way, and `storagetest.Run` checks it.
 
 - **Keys** are forward-slash paths. `storage.ValidateKey` (called by every
   backend, errors wrap `ErrInvalidKey`) rejects empty keys, a leading or
-  trailing `/`, empty, `.` and `..` segments, backslashes, NUL, invalid UTF-8
-  and keys over 1024 bytes.
+  trailing `/`, empty, `.` and `..` segments, segments over 255 bytes,
+  backslashes, NUL, invalid UTF-8 and keys over 1024 bytes. The `s3` key prefix
+  counts towards the 1024 bytes; overflow is rejected as `ErrInvalidKey`.
 - **Missing objects** yield an error wrapping `ErrNotFound` from `Get` and
   `Stat`; test it with `errors.Is`. A key that is only a prefix of other keys
   (`dir` when `dir/x` exists) is missing too.

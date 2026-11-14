@@ -163,3 +163,16 @@ func TestFSPersistsAcrossInstances(t *testing.T) {
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errors.New("boom") }
+
+// TestFSAcceptsEveryValidKey guards the portability promise of ValidateKey:
+// the longest segment it allows must be storable.
+func TestFSAcceptsEveryValidKey(t *testing.T) {
+	f, _ := newFS(t)
+	key := strings.Repeat("a", 255) + "/" + strings.Repeat("b", 255)
+	if err := f.Put(t.Context(), key, strings.NewReader("x"), storage.PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Stat(t.Context(), key); err != nil {
+		t.Fatal(err)
+	}
+}
